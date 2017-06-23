@@ -96,6 +96,7 @@ import hashlib
 import struct
 import errno
 import stat
+import ssl
 from timeit import default_timer as clock
 import contextlib
 import urlparse
@@ -265,7 +266,7 @@ class SourceCache(object):
         """
         return GitSourceCache(self).fetch_git(repository, rev, repo_name)
 
-    def fetch_archive(self, url, type=None):
+    def fetch_archive(self, url, type=None, no_check_certificate=False):
         """Fetches  a tarball without knowing the key up-front.
 
         In automated settings, :meth:`fetch` should be used instead.
@@ -282,7 +283,8 @@ class SourceCache(object):
             when this cannot be determined from the suffix of the url.
 
         """
-        return ArchiveSourceCache(self).fetch_archive(url, type, None)
+        return ArchiveSourceCache(self).fetch_archive(url, type, None,
+                no_check_certificate)
 
 
     def put(self, files):
@@ -314,7 +316,7 @@ class SourceCache(object):
         return handler
 
     @retry(max_tries=3, exceptions=(RemoteFetchError))
-    def fetch(self, url, key, repo_name=None):
+    def fetch(self, url, key, repo_name=None, no_check_certificate=False):
         """Fetch sources whose key is known.
 
         This is the method to use in automated settings. If the
@@ -342,7 +344,7 @@ class SourceCache(object):
         """
         type, hash = key.split(':')
         handler = self._get_handler(type)
-        handler.fetch(url, type, hash, repo_name)
+        handler.fetch(url, type, hash, repo_name, no_check_certificate)
 
     def unpack(self, key, target_path):
         """
@@ -473,7 +475,7 @@ class GitSourceCache(object):
     def _mark_commit_as_in_use(self, repo_name, commit):
         self._ensure_branch(repo_name, 'inuse/%s' % commit, commit)
 
-    def fetch(self, url, type, commit, repo_name):
+    def fetch(self, url, type, commit, repo_name, no_check_certificate):
         assert type == 'git'
         if repo_name is None:
             raise TypeError('Need to provide repo_name when fetching git archive')
@@ -657,7 +659,7 @@ class ArchiveSourceCache(object):
         mkdir_if_not_exists(type_dir)
         return pjoin(type_dir, hash)
 
-    def _download_and_hash(self, url, type):
+    def _download_and_hash(self, url, type, no_check_certificate):
         """Downloads file at url to a temporary location and hashes it
 
         Returns
@@ -675,8 +677,13 @@ class ArchiveSourceCache(object):
         else:
             # Make request.
             sys.stderr.write('Downloading %s...\n' % url)
+            c = ssl.create_default_context()
+            if no_check_certificate:
+                # Skip SSL certificate verification
+                c.check_hostname = False
+                c.verify_mode = ssl.CERT_NONE
             try:
-                stream = urllib2.urlopen(url)
+                stream = urllib2.urlopen(url, context=c)
             except urllib2.HTTPError, e:
                 msg = "urllib failed to download (code: %d): %s" % (e.code, url)
                 self.logger.error(msg)
@@ -739,35 +746,38 @@ class ArchiveSourceCache(object):
     def contains(self, type, hash):
         return os.path.exists(self.get_pack_filename(type, hash))
 
-    def fetch_from_mirrors(self, type, hash):
+    def fetch_from_mirrors(self, type, hash, no_check_certificate):
         for mirror in self.mirrors:
             url = '%s/%s/%s/%s' % (mirror, PACKS_DIRNAME, type, hash)
             try:
-                self._download_archive(url, type, hash)
+                self._download_archive(url, type, hash, no_check_certificate)
             except SourceNotFoundError:
                 continue
             else:
                 return True # found it
         return False
 
-    def fetch(self, url, type, hash, repo_name):
+    def fetch(self, url, type, hash, repo_name, no_check_certificate):
         if type == 'files:':
             raise NotImplementedError("use the put() method to store raw files")
         else:
-            self.fetch_archive(url, type, hash)
+            self.fetch_archive(url, type, hash, no_check_certificate)
 
-    def fetch_archive(self, url, type, expected_hash):
+    def fetch_archive(self, url, type, expected_hash, no_check_certificate):
         if expected_hash is not None:
             found = self.contains(type, expected_hash)
             if not found:
-                found = self.fetch_from_mirrors(type, expected_hash)
+                found = self.fetch_from_mirrors(type, expected_hash,
+                        no_check_certificate)
             if found:
                 return '%s:%s' % (type, expected_hash)
-        return self._download_archive(url, type, expected_hash)
+        return self._download_archive(url, type, expected_hash,
+                no_check_certificate)
 
-    def _download_archive(self, url, type, expected_hash):
+    def _download_archive(self, url, type, expected_hash, no_check_certificate):
         type = self._ensure_type(url, type)
-        temp_file, hash = self._download_and_hash(url, type)
+        temp_file, hash = self._download_and_hash(url, type,
+                no_check_certificate)
         try:
             if expected_hash is not None and expected_hash != hash:
                 raise RuntimeError('File downloaded from "%s" has hash %s but expected %s' %
